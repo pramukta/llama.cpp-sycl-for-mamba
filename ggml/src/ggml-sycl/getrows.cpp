@@ -207,6 +207,10 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
             get_rows_sycl<QK8_0, QR8_0, dequantize_q8_0>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
             src1_i32, (float *)dst->data, ctx.stream());
             break;
+        case GGML_TYPE_Q6_K:
+            get_rows_sycl<QK_K, QR6_K, dequantize_q6_k>(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
+            src1_i32, (float *)dst->data, ctx.stream());
+            break;
         default:
             // TODO: k-quants
             GGML_LOG_ERROR("%s: unsupported type: %s\n", __func__, ggml_type_name(dst->src[0]->type));

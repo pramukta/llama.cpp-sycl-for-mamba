@@ -162,6 +162,61 @@ static __dpct_inline__ void dequantize_q8_0(const void *vx, const int64_t ib,
 #endif // GGML_SYCL_F16
 }
 
+static __dpct_inline__ void dequantize_q6_k(const void *vx, const int64_t ib,
+                                            const int iqs, dfloat2 &v) {
+    const block_q6_K * x = (const block_q6_K *) vx;
+
+    const dfloat d = x[ib].d;
+
+    // iqs range: 0-127, representing positions within first half of 256-element block
+    // Extract TWO elements: at position iqs (0-127) and iqs+128 (128-255)
+
+    // Map iqs to physical layout indices
+    const int l = iqs & 0x1F;           // iqs % 32: position within 32-elem group
+    const int offset_grp = iqs >> 5;    // iqs / 32: which group (0,1,2,3)
+
+    // ql array indexing: alternates between [l] and [l+32]
+    const int ql_idx = (offset_grp & 1) ? (l + 32) : l;
+    const uint8_t ql_byte = x[ib].ql[ql_idx];
+
+    // Nibble selection: low nibble for groups 0,1; high nibble for groups 2,3
+    const int nibble_shift_0 = (offset_grp >= 2) ? 4 : 0;
+    const int nibble_shift_1 = 4 - nibble_shift_0;
+
+    // qh array: each byte encodes 4 elements' upper 2 bits
+    const int qh_idx = l;
+    const uint8_t qh_byte = x[ib].qh[qh_idx];
+
+    // qh bit positions: [1:0], [3:2], [5:4], [7:6] for groups 0,1,2,3
+    const int qh_shift_0 = (offset_grp & 3) * 2;
+    const int qh_shift_1 = qh_shift_0 + 4;  // +4 bits for second element
+
+    // Scale indices: 16 scales total, first half uses 0-7, second half 8-15
+    const int scale_base = (l >> 4) + (offset_grp << 1);  // (l/16) + offset_grp*2
+    const int8_t scale0 = x[ib].scales[scale_base];
+    const int8_t scale1 = x[ib].scales[scale_base + 8];  // Second half uses scales 8-15
+
+    // Extract first element (position iqs in range 0-127)
+    const int q0_4bit = (ql_byte >> nibble_shift_0) & 0xF;
+    const int q0_2bit = (qh_byte >> qh_shift_0) & 3;
+    const int8_t q0 = (int8_t)((q0_4bit | (q0_2bit << 4)) - 32);
+
+    // Extract second element (position iqs+128 in range 128-255)
+    // Uses opposite nibble of same ql byte, upper 4 bits of qh
+    const int q1_4bit = (ql_byte >> nibble_shift_1) & 0xF;
+    const int q1_2bit = (qh_byte >> qh_shift_1) & 3;
+    const int8_t q1 = (int8_t)((q1_4bit | (q1_2bit << 4)) - 32);
+
+    // Dequantize: result = d * scale * (quantized_value - 32)
+#ifdef GGML_SYCL_F16
+    v.s0() = d * scale0 * q0;
+    v.s1() = d * scale1 * q1;
+#else
+    v.x() = d * scale0 * q0;
+    v.y() = d * scale1 * q1;
+#endif
+}
+
 template<typename dst_t>
 static void dequantize_block_q4_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb32,
                                   const sycl::nd_item<3> &item_ct1) {
