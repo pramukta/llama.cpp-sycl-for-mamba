@@ -165,55 +165,37 @@ static __dpct_inline__ void dequantize_q8_0(const void *vx, const int64_t ib,
 static __dpct_inline__ void dequantize_q6_k(const void *vx, const int64_t ib,
                                             const int iqs, dfloat2 &v) {
     const block_q6_K * x = (const block_q6_K *) vx;
-
     const dfloat d = x[ib].d;
 
-    // iqs range: 0-127, representing positions within first half of 256-element block
-    // Extract TWO elements: at position iqs (0-127) and iqs+128 (128-255)
+    // iqs: 0..127, maps to element pair: iqs (first half) and iqs+128 (second half)
+    // Block layout (from dequantize_block_q6_K, ip=0/1, il=0..31):
+    //   position 128*ip + il + {0,32,64,96} uses ql[64*ip+il+{0,32,0,32}], qh[32*ip+il] bits {[1:0],[3:2],[5:4],[7:6]}
+    //   scale = scales[8*ip + il/16 + {0,2,4,6}]
+    const int l = iqs & 31;           // 0..31: position within group
+    const int g = iqs >> 5;           // 0..3: which quarter (0=pos0-31, 1=pos32-63, 2=pos64-95, 3=pos96-127)
 
-    // Map iqs to physical layout indices
-    const int l = iqs & 0x1F;           // iqs % 32: position within 32-elem group
-    const int offset_grp = iqs >> 5;    // iqs / 32: which group (0,1,2,3)
+    const int ql_offset   = 32 * (g & 1);      // groups 0,2 → 0; groups 1,3 → 32
+    const int nibble_shift = (g >= 2) ? 4 : 0; // groups 0,1 → low nibble; groups 2,3 → high nibble
+    const int qh_shift     = g * 2;             // groups 0,1,2,3 → bits [1:0],[3:2],[5:4],[7:6]
 
-    // ql array indexing: alternates between [l] and [l+32]
-    const int ql_idx = (offset_grp & 1) ? (l + 32) : l;
-    const uint8_t ql_byte = x[ib].ql[ql_idx];
+    // v.x(): element at iqs (ip=0), v.y(): element at iqs+128 (ip=1)
+    const uint8_t ql0 = x[ib].ql[l + ql_offset];       // ip=0: ql[0..63]
+    const uint8_t ql1 = x[ib].ql[l + ql_offset + 64];  // ip=1: ql[64..127]
+    const uint8_t qh0 = x[ib].qh[l];                    // ip=0: qh[0..31]
+    const uint8_t qh1 = x[ib].qh[l + 32];               // ip=1: qh[32..63]
 
-    // Nibble selection: low nibble for groups 0,1; high nibble for groups 2,3
-    const int nibble_shift_0 = (offset_grp >= 2) ? 4 : 0;
-    const int nibble_shift_1 = 4 - nibble_shift_0;
+    const int8_t q0 = (int8_t)(((ql0 >> nibble_shift) & 0xF) | (((qh0 >> qh_shift) & 3) << 4)) - 32;
+    const int8_t q1 = (int8_t)(((ql1 >> nibble_shift) & 0xF) | (((qh1 >> qh_shift) & 3) << 4)) - 32;
 
-    // qh array: each byte encodes 4 elements' upper 2 bits
-    const int qh_idx = l;
-    const uint8_t qh_byte = x[ib].qh[qh_idx];
+    const int s0 = 2 * g + (l >> 4);      // scale index for ip=0: 0..7
+    const int s1 = 8 + 2 * g + (l >> 4); // scale index for ip=1: 8..15
 
-    // qh bit positions: [1:0], [3:2], [5:4], [7:6] for groups 0,1,2,3
-    const int qh_shift_0 = (offset_grp & 3) * 2;
-    const int qh_shift_1 = qh_shift_0 + 4;  // +4 bits for second element
-
-    // Scale indices: 16 scales total, first half uses 0-7, second half 8-15
-    const int scale_base = (l >> 4) + (offset_grp << 1);  // (l/16) + offset_grp*2
-    const int8_t scale0 = x[ib].scales[scale_base];
-    const int8_t scale1 = x[ib].scales[scale_base + 8];  // Second half uses scales 8-15
-
-    // Extract first element (position iqs in range 0-127)
-    const int q0_4bit = (ql_byte >> nibble_shift_0) & 0xF;
-    const int q0_2bit = (qh_byte >> qh_shift_0) & 3;
-    const int8_t q0 = (int8_t)((q0_4bit | (q0_2bit << 4)) - 32);
-
-    // Extract second element (position iqs+128 in range 128-255)
-    // Uses opposite nibble of same ql byte, upper 4 bits of qh
-    const int q1_4bit = (ql_byte >> nibble_shift_1) & 0xF;
-    const int q1_2bit = (qh_byte >> qh_shift_1) & 3;
-    const int8_t q1 = (int8_t)((q1_4bit | (q1_2bit << 4)) - 32);
-
-    // Dequantize: result = d * scale * (quantized_value - 32)
 #ifdef GGML_SYCL_F16
-    v.s0() = d * scale0 * q0;
-    v.s1() = d * scale1 * q1;
+    v.s0() = d * x[ib].scales[s0] * q0;
+    v.s1() = d * x[ib].scales[s1] * q1;
 #else
-    v.x() = d * scale0 * q0;
-    v.y() = d * scale1 * q1;
+    v.x() = d * x[ib].scales[s0] * q0;
+    v.y() = d * x[ib].scales[s1] * q1;
 #endif
 }
 
