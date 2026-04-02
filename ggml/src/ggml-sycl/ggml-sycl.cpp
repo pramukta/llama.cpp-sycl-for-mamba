@@ -55,6 +55,7 @@
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/ssm_scan.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
+#include "ggml-sycl/moe.hpp"
 
 
 static bool g_sycl_loaded = false;
@@ -3679,6 +3680,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
+
+    // Dispatch to fused MoE kernel for decode (ne12==1) with Q4_0 weights.
+    // Reads expert IDs on GPU, avoiding CPU sync and enabling graph compilation.
+    if (ne12 == 1 && src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32) {
+        ggml_sycl_moe_gemv_q4_0(ctx, dst);
+        return;
+    }
 
     std::vector<char> ids_host(ggml_nbytes(ids));
     const char * ids_dev = (const char *) ids->data;
