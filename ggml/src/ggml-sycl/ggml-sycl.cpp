@@ -3711,23 +3711,62 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     dst_row.nb[2] = nb1;
     dst_row.nb[3] = nb1;
     if (ne12 == 1) {
-        for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
-            for (int64_t id = 0; id < n_ids; id++) {
-                const int32_t i02 = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
-                GGML_ASSERT(i02 >= 0 && i02 < n_as);
+        // Lambda captures the MMVQ loop body shared by both paths below.
+        auto dispatch_experts = [&]() {
+            for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
+                for (int64_t id = 0; id < n_ids; id++) {
+                    const int32_t i02 = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
+                    GGML_ASSERT(i02 >= 0 && i02 < n_as);
 
-                const int64_t i11 = id % ne11;
-                const int64_t i12 = iid1;
+                    const int64_t i11 = id % ne11;
+                    const int64_t i12 = iid1;
 
-                const int64_t i1 = id;
-                const int64_t i2 = i12;
+                    const int64_t i1 = id;
+                    const int64_t i2 = i12;
 
-            src0_row.data = src0_original + i02*nb02;
-            src1_row.data = src1_original + i11*nb11 + i12*nb12;
-            dst_row.data = dst_original + i1*nb1 + i2*nb2;
+                    src0_row.data = src0_original + i02*nb02;
+                    src1_row.data = src1_original + i11*nb11 + i12*nb12;
+                    dst_row.data = dst_original + i1*nb1 + i2*nb2;
 
-            ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
+                    ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
+                }
             }
+        };
+#ifdef GGML_SYCL_GRAPH
+        // Batch all per-expert MMVQ submissions into a single local command graph
+        // to reduce Level Zero kernel-dispatch overhead. The CPU sync (stream->wait
+        // above) happens before recording, so recording is safe here.
+        // Re-record every call (pointers change per token), then update the stored
+        // executable graph — cheap pointer-swap rather than re-finalize each time.
+        if (dpct::get_device(ctx.device).has(sycl::aspect::ext_oneapi_limited_graph)) {
+            sycl_ex::command_graph local_graph(*stream,
+                {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
+            local_graph.begin_recording(*stream);
+            dispatch_experts();
+            local_graph.end_recording();
+
+            const bool update_support = dpct::get_device(ctx.device).has(sycl::aspect::ext_oneapi_graph);
+            if (!ctx.moe_exec_graph || !update_support) {
+                auto exec = update_support
+                    ? local_graph.finalize(sycl_ex::property::graph::updatable{})
+                    : local_graph.finalize();
+                ctx.moe_exec_graph = std::make_unique<
+                    sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec));
+            } else {
+                try {
+                    ctx.moe_exec_graph->update(local_graph);
+                } catch (sycl::exception const & e) {
+                    GGML_SYCL_DEBUG("[SYCL-GRAPH] MoE graph update failed (%s), re-finalizing\n", e.what());
+                    auto exec = local_graph.finalize(sycl_ex::property::graph::updatable{});
+                    ctx.moe_exec_graph = std::make_unique<
+                        sycl_ex::command_graph<sycl_ex::graph_state::executable>>(std::move(exec));
+                }
+            }
+            stream->ext_oneapi_graph(*ctx.moe_exec_graph);
+        } else
+#endif
+        {
+            dispatch_experts();
         }
     } else {
         ggml_sycl_pool_alloc<char> src1_contiguous(ctx.pool(), sizeof(float)*ggml_nelements(src1));

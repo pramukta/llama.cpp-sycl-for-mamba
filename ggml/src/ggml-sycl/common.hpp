@@ -415,6 +415,8 @@ struct ggml_backend_sycl_context {
 
 #ifdef GGML_SYCL_GRAPH
     std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
+    // Updatable executable graph for batching per-expert MMVQ calls in MUL_MAT_ID.
+    std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> moe_exec_graph = nullptr;
 #endif
 
     ggml_sycl_pool & host_pool(int device) {
