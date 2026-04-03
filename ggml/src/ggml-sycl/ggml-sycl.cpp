@@ -3681,8 +3681,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
-    // Dispatch to fused MoE kernel for decode (ne12==1) with Q4_0 weights.
-    // Reads expert IDs on GPU, avoiding CPU sync and enabling graph compilation.
+    // Fused MoE GEMV for decode (ne12==1): reads expert IDs on GPU, no CPU sync.
+    // Prefill (ne12>1) falls through to MMVQ/MMQ which handles batched GEMM efficiently.
     if (ne12 == 1 && src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32) {
         ggml_sycl_moe_gemv_q4_0(ctx, dst);
         return;
