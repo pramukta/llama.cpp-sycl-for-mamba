@@ -8,7 +8,8 @@ cd build
 source /opt/intel/oneapi/setvars.sh
 
 #for FP16
-cmake .. -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON -DLLAMA_OPENSSL=OFF -DGGML_SYCL_GRAPH=ON # faster for long-prompt inference
+# Note: SYCL graphs disabled - incompatible with MoE models due to dynamic buffer allocation
+cmake .. -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON -DLLAMA_OPENSSL=OFF -DGGML_SYCL_GRAPH=OFF -DGGML_SYCL_DNN=OFF
 
 #for FP32
 # cmake .. -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DLLAMA_OPENSSL=OFF

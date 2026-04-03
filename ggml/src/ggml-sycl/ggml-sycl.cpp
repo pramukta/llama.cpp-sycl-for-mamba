@@ -1244,6 +1244,43 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
     return &ggml_backend_sycl_buffer_type_host;
 }
 
+// Helper functions to unify device memory allocation for both async and sync paths (internal)
+static inline void * sycl_ext_malloc_device(dpct::queue_ptr stream, size_t size) {
+    bool use_async = g_ggml_sycl_use_async_mem_op;
+#if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
+    if (use_async) {
+        return syclex::async_malloc(*stream, sycl::usm::alloc::device, size);
+    }
+#else
+    // If async allocation extension is not available, use_async should always be false.
+    GGML_ASSERT(!use_async);
+#endif
+    return sycl::malloc(size, *stream, sycl::usm::alloc::device);
+}
+
+static inline void sycl_ext_free(dpct::queue_ptr stream, void * ptr) {
+    bool use_async = g_ggml_sycl_use_async_mem_op;
+#if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
+    if (use_async) {
+        syclex::async_free(*stream, ptr);
+        return;
+    }
+#else
+    // If async allocation extension is not available, use_async should always be false.
+    GGML_ASSERT(!use_async);
+#endif
+    sycl::free(ptr, *stream);
+}
+
+// Public wrappers for graph-safe device memory allocation
+void * ggml_sycl_device_malloc(dpct::queue_ptr stream, size_t size) {
+    return sycl_ext_malloc_device(stream, size);
+}
+
+void ggml_sycl_device_free(dpct::queue_ptr stream, void * ptr) {
+    sycl_ext_free(stream, ptr);
+}
+
 // buffer pool for sycl (legacy)
 struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     static const int MAX_SYCL_BUFFERS = 256;
@@ -1264,7 +1301,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         for (int i = 0; i < MAX_SYCL_BUFFERS; ++i) {
             ggml_sycl_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
-                SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(b.ptr, *qptr)));
+                sycl_ext_free(qptr, b.ptr);
                 pool_size -= b.size;
             }
         }
@@ -1312,9 +1349,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         void * ptr;
         size_t look_ahead_size = (size_t) (1.05 * size);
 
-        SYCL_CHECK(
-            CHECK_TRY_ERROR(ptr = (void *)sycl::malloc_device(
-                                look_ahead_size, *qptr)));
+        ptr = sycl_ext_malloc_device(qptr, look_ahead_size);
         if (!ptr) {
             GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device/GPU\n", __func__, look_ahead_size);
             return nullptr;
@@ -1342,7 +1377,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
             }
         }
         GGML_LOG_WARN("WARNING: sycl buffer pool full, increase MAX_sycl_BUFFERS\n");
-        SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, *qptr)));
+        sycl_ext_free(qptr, ptr);
         pool_size -= size;
     }
 };
@@ -1369,7 +1404,7 @@ struct ggml_sycl_pool_host : public ggml_sycl_pool {
         for (int i = 0; i < MAX_POOL_SIZE; ++i) {
             ggml_sycl_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
-                SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(b.ptr, *qptr)));
+                sycl_ext_free(qptr, b.ptr);
                 b.ptr = nullptr;
                 pool_size -= b.size;
                 b.size = 0;
@@ -3298,34 +3333,6 @@ static bool ggml_sycl_supports_dmmv(enum ggml_type type) {
     }
 }
 
-// Helper functions to unify device memory allocation for both async and sync paths
-static inline void * sycl_ext_malloc_device(dpct::queue_ptr stream, size_t size) {
-    bool use_async = g_ggml_sycl_use_async_mem_op;
-#if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
-    if (use_async) {
-        return syclex::async_malloc(*stream, sycl::usm::alloc::device, size);
-    }
-#else
-    // If async allocation extension is not available, use_async should always be false.
-    GGML_ASSERT(!use_async);
-#endif
-    return sycl::malloc(size, *stream, sycl::usm::alloc::device);
-}
-
-static inline void sycl_ext_free(dpct::queue_ptr stream, void * ptr) {
-    bool use_async = g_ggml_sycl_use_async_mem_op;
-#if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
-    if (use_async) {
-        syclex::async_free(*stream, ptr);
-        return;
-    }
-#else
-    // If async allocation extension is not available, use_async should always be false.
-    GGML_ASSERT(!use_async);
-#endif
-    sycl::free(ptr, *stream);
-}
-
 static void reorder_qw_q4_0(uint8_t * data_device, const int ncols, const int nrows, size_t size, size_t offset,
                             dpct::queue_ptr stream) {
     uint8_t * tmp_buf = static_cast<uint8_t *>(sycl_ext_malloc_device(stream, size));
@@ -3682,8 +3689,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_ids = ids->ne[0];
 
     // Fused MoE GEMV for decode (ne12==1): reads expert IDs on GPU, no CPU sync.
+    // Supports both Q4_0 and F32 weights. Graph-compatible.
     // Prefill (ne12>1) falls through to MMVQ/MMQ which handles batched GEMM efficiently.
-    if (ne12 == 1 && src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32) {
+    if (ne12 == 1 && src1->type == GGML_TYPE_F32 &&
+        (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_F32)) {
         ggml_sycl_moe_gemv_q4_0(ctx, dst);
         return;
     }
@@ -4303,6 +4312,15 @@ static const char * ggml_backend_sycl_get_name(ggml_backend_t backend) {
 static void ggml_backend_sycl_free(ggml_backend_t backend) {
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
 
+    // Wait for all pending operations before cleanup
+    sycl_ctx->stream()->wait();
+
+    // Free persistent MoE Q8_1 buffer if allocated
+    if (sycl_ctx->moe_q8_buffer) {
+        sycl::free(sycl_ctx->moe_q8_buffer, *(sycl_ctx->stream()));
+        sycl_ctx->moe_q8_buffer = nullptr;
+    }
+
     delete sycl_ctx;
     delete backend;
 }
@@ -4422,6 +4440,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
 #ifdef GGML_SYCL_GRAPH
 static bool check_graph_compatibility(ggml_cgraph * cgraph) {
+#if GGML_SYCL_DNNL
+    // oneDNN (DNNL) operations are not compatible with SYCL graph recording.
+    // DNNL creates memory objects during execution which fails in graph recording mode.
+    GGML_LOG_INFO("%s: disabling SYCL graphs due to oneDNN (DNNL) backend\n", __func__);
+    return false;
+#endif
+
     if (ggml_sycl_info().device_count > 1) {
         // A sycl_ex::command_graph object can only be created for a single device
         GGML_LOG_INFO("%s: disabling SYCL graphs due to multiple devices\n", __func__);
@@ -4433,17 +4458,13 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
         switch (node_op) {
             default:
                 break;
-            case GGML_OP_CONCAT:
-                // ggml_sycl_op_concat() does a blocking host wait after memcpy operations,
-                // but wait() can't be called on the events returned by a queue recording
-                // to a graph.
-                [[fallthrough]];
             case GGML_OP_MUL_MAT_ID:
-                // ggml_sycl_mul_mat_id() does a blocking host wait on the sycl queue after
-                // submitting a memcpy operation, but wait() can't be called on a queue that
-                // is recording to a graph.
-                GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
-                              ggml_op_name(node_op));
+                // MoE (MUL_MAT_ID) is incompatible with SYCL graphs because:
+                // - Graphs bake in buffer addresses at recording time
+                // - ggml allocator reuses buffers dynamically (src1->data changes between layers)
+                // - Graph replays read from stale addresses, producing corrupted output
+                // The fused MoE kernel works correctly in eager mode with good performance.
+                GGML_LOG_INFO("%s: disabling SYCL graphs due to MUL_MAT_ID (dynamic buffer allocation incompatible)\n", __func__);
                 return false;
             case GGML_OP_MUL_MAT:
                 // We cannot use graphs with ggml_sycl_mul_mat() when SYCL async memory allocation extensions are not available,
@@ -4469,6 +4490,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
 #ifdef GGML_SYCL_GRAPH
     bool use_sycl_graph = !g_ggml_sycl_disable_graph && check_graph_compatibility(cgraph);
     if (use_sycl_graph) {
+        GGML_LOG_INFO("[SYCL-GRAPH] g_ggml_sycl_use_async_mem_op = %d\n", g_ggml_sycl_use_async_mem_op);
         const bool graph_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_limited_graph);
         if (!graph_support) {
             GGML_SYCL_DEBUG("[SYCL-GRAPH] can not use graphs on device:%d\n", sycl_ctx->device);
@@ -4476,31 +4498,84 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             return GGML_STATUS_SUCCESS;
         }
 
-        sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()), {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
-
-        model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
-        ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
-        model_sycl_graph.end_recording();
-
-        const bool graph_update_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_graph);
-        if (!sycl_ctx->exec_graph || !graph_update_support) {
-            auto exec_graph = graph_update_support ? model_sycl_graph.finalize(sycl_ex::property::graph::updatable{}) :
-                                                     model_sycl_graph.finalize();
-            sycl_ctx->exec_graph = std::make_unique<
-                sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec_graph);
-        } else {
-            try {
-                sycl_ctx->exec_graph->update(model_sycl_graph);
-                GGML_SYCL_DEBUG("[SYCL-GRAPH] update success\n");
-            } catch (sycl::exception const & e) {
-                GGML_SYCL_DEBUG("[SYCL-GRAPH] Exception when updating graph, %s\n", e.what());
-                auto exec_graph = model_sycl_graph.finalize({sycl_ex::property::graph::updatable{}});
-                sycl_ctx->exec_graph = std::make_unique<
-                    sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec_graph);
+        // Pre-allocate persistent Q8_1 buffer for fused MoE decode kernels.
+        // Must happen outside begin_recording so the address is stable and baked into the graph.
+        // assume_buffer_outlives_graph above tells the driver this buffer is valid at replay time.
+        {
+            size_t moe_q8_needed = 0;
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                const ggml_tensor * node = cgraph->nodes[i];
+                if (node->op != GGML_OP_MUL_MAT_ID) continue;
+                const ggml_tensor * src0 = node->src[0];
+                const ggml_tensor * src1 = node->src[1];
+                if (src1->ne[2] != 1 || src1->type != GGML_TYPE_F32) continue;
+                if (src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_F32) continue;
+                const size_t sz = (size_t)src1->ne[1] * ggml_row_size(GGML_TYPE_Q8_1, src1->ne[0]);
+                if (sz > moe_q8_needed) moe_q8_needed = sz;
+            }
+            if (moe_q8_needed > sycl_ctx->moe_q8_buffer_size) {
+                if (sycl_ctx->moe_q8_buffer) {
+                    sycl_ext_free(sycl_ctx->stream(), sycl_ctx->moe_q8_buffer);
+                }
+                GGML_LOG_INFO("[SYCL-GRAPH] pre-allocating %zu bytes for MoE Q8_1 buffer\n", moe_q8_needed);
+                sycl_ctx->moe_q8_buffer = sycl_ext_malloc_device(sycl_ctx->stream(), moe_q8_needed);
+                sycl_ctx->moe_q8_buffer_size = moe_q8_needed;
+                GGML_LOG_INFO("[SYCL-GRAPH] allocated buffer at %p\n", sycl_ctx->moe_q8_buffer);
+            } else if (moe_q8_needed > 0) {
+                GGML_LOG_INFO("[SYCL-GRAPH] reusing existing buffer at %p (size=%zu, needed=%zu)\n",
+                             sycl_ctx->moe_q8_buffer, sycl_ctx->moe_q8_buffer_size, moe_q8_needed);
             }
         }
 
-        sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
+        // Disable weight reordering optimization for graph mode.
+        // Reordering uses temp buffer malloc/free which hangs during graph recording.
+        // Save and restore the device's reorder feature flag.
+        GGML_LOG_INFO("[SYCL-GRAPH] disabling weight reorder optimization for graph mode\n");
+        const bool saved_reorder_feature = sycl_ctx->opt_feature.reorder;
+        sycl_ctx->opt_feature.reorder = false;
+
+        try {
+            GGML_LOG_INFO("[SYCL-GRAPH] creating command graph\n");
+            sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()), {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
+
+            GGML_LOG_INFO("[SYCL-GRAPH] begin_recording\n");
+            model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
+            GGML_LOG_INFO("[SYCL-GRAPH] executing graph nodes\n");
+            ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+            GGML_LOG_INFO("[SYCL-GRAPH] end_recording\n");
+            model_sycl_graph.end_recording();
+
+            // Don't mark as updatable since quantize_row_q8_1_sycl uses memcpy which isn't updatable.
+            // We compile the graph once and reuse it (decode graphs have fixed structure).
+            if (!sycl_ctx->exec_graph) {
+                GGML_LOG_INFO("[SYCL-GRAPH] finalizing graph (non-updatable)\n");
+                auto exec_graph = model_sycl_graph.finalize();
+                sycl_ctx->exec_graph = std::make_unique<
+                    sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec_graph);
+                GGML_LOG_INFO("[SYCL-GRAPH] decode graph compiled on device:%d\n", sycl_ctx->device);
+            }
+
+            GGML_LOG_INFO("[SYCL-GRAPH] submitting graph for execution\n");
+            sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
+            GGML_LOG_INFO("[SYCL-GRAPH] graph execution submitted\n");
+
+            // Wait for graph execution to complete before returning.
+            // The backend scheduler expects graph_compute to be synchronous.
+            GGML_LOG_INFO("[SYCL-GRAPH] waiting for graph completion\n");
+            sycl_ctx->stream()->wait();
+            GGML_LOG_INFO("[SYCL-GRAPH] graph execution complete\n");
+        } catch (sycl::exception const & e) {
+            // Graph compilation failed — fall back to eager (non-graph) execution.
+            GGML_LOG_INFO("[SYCL-GRAPH] graph compile failed: %s, falling back to eager\n", e.what());
+            sycl_ctx->exec_graph.reset();
+            // Restore reorder feature before eager execution
+            sycl_ctx->opt_feature.reorder = saved_reorder_feature;
+            ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
+            return GGML_STATUS_SUCCESS;
+        }
+
+        // Restore reorder feature after successful graph recording
+        sycl_ctx->opt_feature.reorder = saved_reorder_feature;
     } else
 #endif
     {

@@ -47,6 +47,10 @@ namespace syclexp = sycl::ext::oneapi::experimental;
 void* ggml_sycl_host_malloc(size_t size);
 void ggml_sycl_host_free(void* ptr);
 
+// Graph-safe device memory allocation (uses async alloc when graphs enabled)
+void * ggml_sycl_device_malloc(dpct::queue_ptr stream, size_t size);
+void ggml_sycl_device_free(dpct::queue_ptr stream, void * ptr);
+
 
 extern int g_ggml_sycl_debug;
 extern int g_ggml_sycl_disable_optimize;
@@ -418,6 +422,10 @@ struct ggml_backend_sycl_context {
     // Updatable executable graph for batching per-expert MMVQ calls in MUL_MAT_ID.
     std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> moe_exec_graph = nullptr;
 #endif
+
+    // Persistent Q8_1 buffer for fused MoE decode kernel (graph-compatible).
+    void * moe_q8_buffer = nullptr;
+    size_t moe_q8_buffer_size = 0;
 
     ggml_sycl_pool & host_pool(int device) {
         if (host_pools[device] == nullptr) {
