@@ -1,4 +1,4 @@
-ARG ONEAPI_VERSION=2025.3.2-0-devel-ubuntu24.04
+ARG ONEAPI_VERSION=2025.3.3-0-devel-ubuntu24.04
 
 ## Build Image
 
@@ -51,7 +51,7 @@ RUN mkdir /tmp/neo/ && cd /tmp/neo/ \
   && dpkg --install *.deb
 
 RUN apt-get update \
-    && apt-get install -y libgomp1 curl\
+    && apt-get install -y libgomp1 curl \
     && apt autoremove -y \
     && apt clean -y \
     && rm -rf /tmp/* /var/tmp/* \
